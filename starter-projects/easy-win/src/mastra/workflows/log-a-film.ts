@@ -28,7 +28,41 @@ const es = new Client({
 });
 const INDEX = process.env.KNOWLEDGE_INDEX ?? "knowledge-base";
 
+/** How often to check whether the film tab is still open, and how long to wait. */
+const TAB_POLL_MS = Number(process.env.TAB_POLL_MS ?? 15_000);
+const WATCH_TIMEOUT_MS = Number(process.env.WATCH_TIMEOUT_MS ?? 4 * 60 * 60 * 1000);
+
 const call = (tool: unknown, args: unknown) => (tool as any).execute(args);
+
+/**
+ * MCP tools return { content: [{ type: "text", text: "..." }] }, NOT a string.
+ * Stringifying that object gives "[object Object]" and every regex silently
+ * fails - which is exactly why the Prime check reported false for everything.
+ */
+/** neo's MCP tools report failure by RETURNING {error:true,message}, not by
+ *  throwing - so a plain try/catch never sees it. Convert it to a throw. */
+function mcpOk(res: any): any {
+  if (res && res.error) throw new Error(String(res.message ?? "MCP tool error"));
+  return res;
+}
+
+/** neo returns the new tab's id only inside its text ("opened page 14"),
+ *  never as a field - so it has to be parsed out. */
+function mcpPageId(res: any): number | undefined {
+  const m = /opened page (\d+)/i.exec(mcpText(res));
+  return m ? Number(m[1]) : undefined;
+}
+
+function mcpText(res: any): string {
+  if (res == null) return "";
+  if (typeof res === "string") return res;
+  const c = res.content ?? res;
+  if (Array.isArray(c)) {
+    return c.map((p: any) => (typeof p === "string" ? p : p?.text ?? "")).join("\n");
+  }
+  if (typeof c === "string") return c;
+  return typeof res.text === "string" ? res.text : JSON.stringify(res);
+}
 
 const tasteEvidenceSchema = z.array(
   z.object({ title: z.string(), content: z.string(), recency: z.number() })
@@ -61,6 +95,22 @@ const recommend = createStep({
 });
 
 /* 2. A recommendation you cannot stream is useless - ask the real Prime catalogue. */
+
+/**
+ * A tabs-tool result carries the new page's id either as structured content
+ * or inside a JSON text part - accept it from either place.
+ */
+const pageIdFrom = (res: any): unknown => {
+  if (res?.pageId !== undefined) return res.pageId;
+  if (res?.page !== undefined) return res.page;
+  try {
+    const parsed = JSON.parse(mcpText(res));
+    return parsed?.pageId ?? parsed?.page;
+  } catch {
+    return undefined;
+  }
+};
+
 const checkPrime = createStep({
   id: "check-prime",
   inputSchema: recommend.outputSchema,
@@ -111,18 +161,23 @@ const checkPrime = createStep({
       const url = mkUrl(title);
       let pageId: unknown;
       try {
-        const page: any = await tools.neo_tabs.execute({ context: { action: "new", url } });
-        pageId = page?.pageId ?? page?.page;
+        // Tool.execute() takes the tool's arguments DIRECTLY - a { context: ... }
+        // envelope fails input validation (returned, not thrown) and the real
+        // arguments never reach the MCP server.
+        const page: any = await call(tools.neo_tabs, { action: "new", url });
+        pageId = pageIdFrom(page);
         await tools.neo_wait
-          ?.execute({ context: { page: pageId, for: "time", value: 6000 } })
+          ?.execute({ page: pageId, for: "time", value: 6000 })
           .catch(() => {});
         // Grep the accessibility tree: result cards surface as links/buttons
         // carrying the film's title. Entitlement (included vs rent) is NOT
         // exposed at search level, so onPrime means "in the catalogue".
-        const found: any = await tools.neo_grep.execute({
-          context: { page: pageId, pattern: title.split(/\s+/).slice(0, 3).join("\\s+"), limit: 15 },
+        const found: any = await call(tools.neo_grep, {
+          page: pageId,
+          pattern: title.split(/\s+/).slice(0, 3).join("\\s+"),
+          limit: 15,
         });
-        const lines = String(found?.content ?? found ?? "")
+        const lines = mcpText(found)
           .split("\n")
           .filter((l) => /link|button/i.test(l));
         const want = norm(title);
@@ -136,9 +191,7 @@ const checkPrime = createStep({
         // Close the tab even when the read failed, so a long candidate list
         // does not leave a trail of open tabs in the user's browser.
         if (pageId !== undefined) {
-          await tools.neo_tabs
-            .execute({ context: { action: "close", page: pageId } })
-            .catch(() => {});
+          await call(tools.neo_tabs, { action: "close", page: pageId }).catch(() => {});
         }
       }
     }
@@ -146,41 +199,127 @@ const checkPrime = createStep({
   },
 });
 
-/* 3. SUSPEND while the film plays, then ask out loud and listen. */
+/* 3. Say WHY out loud, open the film, then wait for the tab to close.
+ *
+ * "Has the film finished?" is near-impossible to read off Prime's player, but
+ * "did the user close the tab?" is unambiguous - so the human closing the tab
+ * IS the completion signal. That is the trigger this step waits on.
+ */
+const announceAndWatch = createStep({
+  id: "announce-and-watch",
+  inputSchema: checkPrime.outputSchema,
+  outputSchema: z.object({
+    watchedTitle: z.string(),
+    reason: z.string(),
+    tabClosed: z.boolean(),
+  }),
+  execute: async ({ inputData, mastra }) => {
+    const pick =
+      inputData.candidates.find((c) => c.onPrime) ?? inputData.candidates[0];
+    if (!pick) return { watchedTitle: "", reason: "", tabClosed: false };
+
+    // The reason must come from THEIR reviews, not invented enthusiasm.
+    let reason = `I picked ${pick.title} for you.`;
+    try {
+      const agent = mastra!.getAgent("memoryAgent");
+      const evidence = inputData.tasteEvidence
+        .slice(0, 4)
+        .map((t) => `- ${t.title}: ${t.content}`)
+        .join("\n");
+      const res: any = await agent.generate(
+        [
+          `In TWO short spoken sentences, tell the user why you are recommending "${pick.title}".`,
+          "Ground it in what THEY wrote, quoting a few of their own words. Do not invent opinions.",
+          "This will be read aloud, so no markdown, no lists, no emoji.",
+          "",
+          "Their recent reviews:",
+          evidence,
+        ].join("\n")
+      );
+      const t = String(res?.text ?? "").trim();
+      if (t) reason = t;
+    } catch {
+      /* keep the plain fallback rather than failing the run */
+    }
+
+    try {
+      await call(speakQuestion, { text: reason });
+    } catch {
+      /* speech is a nicety; the run continues silently */
+    }
+
+    // Open it, remember the tab, then watch for that tab to disappear.
+    let tabClosed = false;
+    try {
+      const tools: any = await neoTools();
+      const opened: any = mcpOk(await tools.neo_tabs.execute({ action: "new", url: pick.url }));
+      const pageId = mcpPageId(opened);
+      const deadline = Date.now() + WATCH_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, TAB_POLL_MS));
+        // A failed list must NOT be read as "the tab closed" - that would end
+        // the wait immediately and skip the film entirely.
+        let listed: any;
+        try {
+          listed = mcpOk(await tools.neo_tabs.execute({ action: "list" }));
+        } catch {
+          continue;
+        }
+        const stillOpen = new RegExp(`\b${pageId}\b`).test(mcpText(listed));
+        if (!stillOpen) {
+          tabClosed = true;
+          break;
+        }
+      }
+    } catch {
+      tabClosed = false;
+    }
+
+    return { watchedTitle: pick.title, reason, tabClosed };
+  },
+});
+
+/* 4. SUSPEND while the film plays, then ask out loud and listen. */
 const captureReview = createStep({
   id: "capture-review",
-  inputSchema: checkPrime.outputSchema,
+  inputSchema: announceAndWatch.outputSchema,
   outputSchema: z.object({ watchedTitle: z.string(), spokenReview: z.string() }),
   resumeSchema: z.object({
-    watchedTitle: z.string().describe("the film you actually watched"),
+    watchedTitle: z.string().optional().describe("override the film we think you watched"),
     recordSeconds: z.number().optional(),
     typedReview: z.string().optional().describe("skip voice capture and use this text"),
   }),
-  suspendSchema: z.object({ candidates: z.any(), message: z.string() }),
+  suspendSchema: z.object({ watchedTitle: z.string(), message: z.string() }),
   execute: async ({ inputData, resumeData, suspend }) => {
-    if (!resumeData) {
+    // The tab closing IS the "film finished" signal. If we saw it close we go
+    // straight on and ask; otherwise we suspend and wait for a human nudge.
+    if (!resumeData && !inputData.tabClosed) {
       // Return the suspend result directly - suspend() does not halt JS execution.
       return await suspend({
-        candidates: inputData.candidates,
-        message: "Go watch one of these. Resume with the title you watched.",
+        watchedTitle: inputData.watchedTitle,
+        message:
+          "Still watching. Resume when you're done (or pass typedReview to skip voice).",
       });
     }
-    if (resumeData.typedReview) {
-      return { watchedTitle: resumeData.watchedTitle, spokenReview: resumeData.typedReview };
+    const watchedTitle = resumeData?.watchedTitle || inputData.watchedTitle;
+    if (resumeData?.typedReview) {
+      return { watchedTitle, spokenReview: resumeData.typedReview };
     }
     // A failing mic or speech API must not lose the run. Fall through to an
     // empty review the user can still fill in on resume.
     try {
       await call(speakQuestion, {
-        text: `So, how was ${resumeData.watchedTitle}? Tell me what you thought.`,
+        text:
+          `Did you finish ${watchedTitle}? If so - how was it, ` +
+          `and what would you rate it out of five?`,
       });
     } catch {
       /* the question is a nicety; carry on and still record */
     }
     try {
-      const rec: any = await call(recordAnswer, { seconds: resumeData.recordSeconds ?? 25 });
+      const rec: any = await call(recordAnswer, { seconds: resumeData?.recordSeconds ?? 25 });
       const tr: any = await call(transcribeAnswer, { audioPath: rec.audioPath });
-      return { watchedTitle: resumeData.watchedTitle, spokenReview: String(tr.text ?? "") };
+      return { watchedTitle, spokenReview: String(tr.text ?? "") };
     } catch (err) {
       throw new Error(
         `Voice capture failed (${(err as Error).message}). Resume this step again with ` +
@@ -263,7 +402,7 @@ const postAndReingest = createStep({
     let posted = false;
     try {
       const tools: any = await neoTools();
-      await tools.neo_tabs.execute({ context: { action: "new", url: filmUrl } });
+      await tools.neo_tabs.execute({ action: "new", url: filmUrl });
       posted = true;
     } catch {
       posted = false;
@@ -297,6 +436,7 @@ export const logAFilm = createWorkflow({
 })
   .then(recommend)
   .then(checkPrime)
+  .then(announceAndWatch)
   .then(captureReview)
   .then(structure)
   .then(postAndReingest)
