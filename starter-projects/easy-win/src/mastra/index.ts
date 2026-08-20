@@ -10,9 +10,12 @@ import { Mastra } from "@mastra/core";
 import { Observability, MastraStorageExporter } from "@mastra/observability";
 import { bareLlmAgent, easyWinAgent } from "./agents/easy-agents";
 import { memoryAgent } from "./agents/memory-agent";
+import { logAFilm } from "./workflows/log-a-film";
 
 export const mastra = new Mastra({
   agents: { bareLlmAgent, easyWinAgent, memoryAgent },
+  // The closed loop: recommend -> watch -> speak your review -> post -> re-ingest.
+  workflows: { logAFilm },
   // Records agent traces (LLM turns, tool calls) so they show up in Studio's
   // Traces view - the demo and the judging rubric both use it.
   observability: new Observability({

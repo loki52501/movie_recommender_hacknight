@@ -3,3 +3,5 @@ dist/
 .mastra/
 .env
 memory.db*
+.tmp-voice/
+letterboxd-raw.json

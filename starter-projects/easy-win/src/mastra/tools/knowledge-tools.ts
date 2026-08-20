@@ -90,3 +90,92 @@ FROM ${INDEX} METADATA _id, _score, _index
     return { results };
   },
 });
+
+/**
+ * recallRecentTaste - the same FORK/FUSE hybrid retrieval as searchKnowledge,
+ * but re-ranked by WHEN the user watched each film, for "what should I watch
+ * next" requests where current taste matters more than all-time taste.
+ *
+ * Tuning decisions, and why:
+ *
+ * - WHY a 4320 hour (180 day) scale: the corpus spans 2025-06 to 2026-04, so
+ *   watches are spread over ~10 months. The scale is where the decay has eaten
+ *   most of the score, and 180 days sits at the corpus's midpoint - a film from
+ *   ~6 months ago still carries meaningful weight. A 90 day scale would treat
+ *   most of this corpus as "ancient" and flatten the ranking.
+ * - The scale is written as a time_duration (`4320 hours`), NOT a date_period
+ *   (`180 days`): DECAY's third argument only accepts time_duration values, and
+ *   a date_period literal is rejected by ES|QL.
+ * - WHY {"type":"exp"}: the DEFAULT decay curve hard-cliffs to exactly 0.0
+ *   beyond the scale, which would zero out every watch older than the scale and
+ *   collapse them into unrankable ties. "exp" decays smoothly and never fully
+ *   reaches 0, so an old-but-relevant film can still surface. Deliberate choice.
+ * - WHY combined = _score * (0.4 + 0.6 * recency): recency is a boost, not a
+ *   gate. The 0.4 floor keeps 40% of the hybrid relevance score for the oldest
+ *   films, so a great semantic match from last year can still outrank a
+ *   mediocre match from last week; the 0.6 share lets a fresh watch climb.
+ * - WHY COALESCE(watched_date, TO_DATETIME("1970-01-01T00:00:00.000Z")): some documents have an empty
+ *   watched_date. DECAY over null returns null, which would poison `combined`
+ *   to null and silently misplace (or drop) those rows from the sort. Pinning
+ *   missing dates to 1970 gives them a recency of ~0 - they rank last, but
+ *   neither crash the query nor vanish.
+ */
+export const recallRecentTaste = createTool({
+  id: "recall_recent_taste",
+  description:
+    "Recall what the user has been into LATELY. Same hybrid search as " +
+    "search_knowledge, but recency-weighted so recent watches outrank older ones. " +
+    "Use this for 'what should I watch' style requests.",
+  inputSchema: z.object({
+    query: z.string().describe("What to look for - a topic, a vibe, or a title"),
+    limit: z.number().min(1).max(15).default(5),
+  }),
+  outputSchema: z.object({
+    results: z.array(
+      z.object({
+        title: z.string(),
+        content: z.string(),
+        rating: z.number().nullable(),
+        reviewed: z.boolean(),
+        watchedDate: z.string(),
+        score: z.number(),
+        recency: z.number(),
+      })
+    ),
+  }),
+  execute: async (input) => {
+    const q = esqlEscape(input.query);
+    const query = `
+FROM ${INDEX} METADATA _id, _score, _index
+| FORK (
+    WHERE title:"${q}" OR content:"${q}"
+    | SORT _score DESC | LIMIT 50
+) (
+    WHERE content_semantic:"${q}"
+    | SORT _score DESC | LIMIT 50
+)
+| FUSE WITH { "weights": { "fork1": 1.0, "fork2": 3.0 } }
+| EVAL recency = DECAY(COALESCE(watched_date, TO_DATETIME("1970-01-01T00:00:00.000Z")), NOW(), 4320 hours, {"type":"exp"})
+| EVAL combined = _score * (0.4 + 0.6 * recency)
+| SORT combined DESC
+| LIMIT ${input.limit}
+| KEEP title, content, rating, reviewed, watched_date, recency, combined
+`.trim();
+
+    const result = await es.esql.query({ query, format: "json" });
+    const cols = (result as any).columns.map((c: { name: string }) => c.name);
+    const idx = (n: string) => cols.indexOf(n);
+    const results = ((result as any).values as unknown[][]).map((row) => ({
+      title: String(row[idx("title")]),
+      content: String(row[idx("content")]).slice(0, 800),
+      rating: row[idx("rating")] === null ? null : Number(row[idx("rating")]),
+      reviewed: Boolean(row[idx("reviewed")]),
+      watchedDate: row[idx("watched_date")] ? String(row[idx("watched_date")]).slice(0, 10) : "",
+      // The DECAY pipeline drops _score from KEEP, so `score` is the combined
+      // (relevance * recency-boosted) score the rows were actually sorted by.
+      score: Number(row[idx("combined")]),
+      recency: Number(row[idx("recency")]),
+    }));
+    return { results };
+  },
+});
