@@ -69,12 +69,69 @@ const tasteEvidenceSchema = z.array(
   z.object({ title: z.string(), content: z.string(), recency: z.number() })
 );
 
+/* 0. Ask out loud what they're in the mood for, and listen.
+ *
+ * The whole loop is meant to be spoken, so the request itself is spoken too.
+ * Pass a `request` in to skip this (useful for tests and for Studio).
+ */
+const askWhatTheyWant = createStep({
+  id: "ask-what-they-want",
+  inputSchema: z.object({
+    request: z.string().optional(),
+    candidateTitles: z.array(z.string()).optional(),
+    askSeconds: z.number().optional(),
+  }),
+  outputSchema: z.object({
+    request: z.string(),
+    candidateTitles: z.array(z.string()).optional(),
+    spokenRequest: z.boolean(),
+  }),
+  execute: async ({ inputData }) => {
+    const typed = (inputData.request ?? "").trim();
+    if (typed) {
+      return {
+        request: typed,
+        candidateTitles: inputData.candidateTitles,
+        spokenRequest: false,
+      };
+    }
+    try {
+      await call(speakQuestion, {
+        text: "What do you feel like watching tonight? Give me a mood, a genre, or a film you loved.",
+      });
+    } catch {
+      /* if it cannot speak, still try to listen */
+    }
+    try {
+      const rec: any = await call(recordAnswer, { seconds: inputData.askSeconds ?? 12 });
+      const tr: any = await call(transcribeAnswer, { audioPath: rec.audioPath });
+      const heard = String(tr.text ?? "").trim();
+      if (heard) {
+        return {
+          request: heard,
+          candidateTitles: inputData.candidateTitles,
+          spokenRequest: true,
+        };
+      }
+    } catch {
+      /* fall through to the neutral request below */
+    }
+    // Heard nothing usable - fall back to their recent taste rather than failing.
+    return {
+      request: "something I would enjoy tonight",
+      candidateTitles: inputData.candidateTitles,
+      spokenRequest: false,
+    };
+  },
+});
+
 /* 1. What are they into LATELY - not what they liked a year ago. */
 const recommend = createStep({
   id: "recommend",
   inputSchema: z.object({
     request: z.string(),
     candidateTitles: z.array(z.string()).optional(),
+    spokenRequest: z.boolean().optional(),
   }),
   outputSchema: z.object({
     request: z.string(),
@@ -465,11 +522,13 @@ const postAndReingest = createStep({
 export const logAFilm = createWorkflow({
   id: "log-a-film",
   inputSchema: z.object({
-    request: z.string(),
+    request: z.string().optional().describe("leave empty to be asked out loud"),
     candidateTitles: z.array(z.string()).optional(),
+    askSeconds: z.number().optional(),
   }),
   outputSchema: postAndReingest.outputSchema,
 })
+  .then(askWhatTheyWant)
   .then(recommend)
   .then(checkPrime)
   .then(announceAndWatch)
