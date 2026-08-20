@@ -29,6 +29,10 @@ const es = new Client({
 const INDEX = process.env.KNOWLEDGE_INDEX ?? "knowledge-base";
 
 /** How often to check whether the film tab is still open, and how long to wait. */
+/** Gap between the question finishing and the mic opening. Playback is not
+ *  reliably blocking, so without this the recorder captures the tail of the
+ *  question and silence instead of the answer. */
+const VOICE_GAP_MS = Number(process.env.VOICE_GAP_MS ?? 1800);
 const PAGE_SETTLE_MS = Number(process.env.PAGE_SETTLE_MS ?? 9000);
 const TAB_POLL_MS = Number(process.env.TAB_POLL_MS ?? 15_000);
 const WATCH_TIMEOUT_MS = Number(process.env.WATCH_TIMEOUT_MS ?? 4 * 60 * 60 * 1000);
@@ -102,6 +106,7 @@ const askWhatTheyWant = createStep({
     } catch {
       /* if it cannot speak, still try to listen */
     }
+    await new Promise((r) => setTimeout(r, VOICE_GAP_MS));
     try {
       const rec: any = await call(recordAnswer, { seconds: inputData.askSeconds ?? 12 });
       const tr: any = await call(transcribeAnswer, { audioPath: rec.audioPath });
@@ -409,6 +414,7 @@ const captureReview = createStep({
     } catch {
       /* the question is a nicety; carry on and still record */
     }
+    await new Promise((r) => setTimeout(r, VOICE_GAP_MS));
     try {
       const rec: any = await call(recordAnswer, { seconds: resumeData?.recordSeconds ?? 25 });
       const tr: any = await call(transcribeAnswer, { audioPath: rec.audioPath });
