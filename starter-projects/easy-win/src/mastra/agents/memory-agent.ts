@@ -23,6 +23,7 @@ import { ElasticSearchVector } from "@mastra/elasticsearch";
 import { LibSQLStore } from "@mastra/libsql";
 import { Client } from "@elastic/elasticsearch";
 import { createElasticEmbedder } from "../elastic-embedder";
+import { searchKnowledge } from "../tools/knowledge-tools";
 import "dotenv/config";
 
 const esVector = new ElasticSearchVector({
@@ -64,11 +65,14 @@ const memory = new Memory({
     // the Studio trace (updateWorkingMemory tool call).
     workingMemory: {
       enabled: true,
-      template: `# User Profile
+      template: `# Film Taste Profile
 - Name:
-- Favorite games / genres:
-- Preferences (player count, session length, complexity):
-- Dislikes / games to avoid:
+- Genres / moods they gravitate to:
+- Languages & regional cinema they watch:
+- Directors, actors or eras they respond to:
+- What they want right now (mood, runtime, who they're watching with):
+- Turn-offs / films they bounced off:
+- Films already recommended to them (so we stop repeating ourselves):
 `,
     },
   },
@@ -77,9 +81,33 @@ const memory = new Memory({
 export const memoryAgent = new Agent({
   id: "memory-agent",
   name: "memory-agent",
-  instructions:
-    "You are a helpful assistant with memory of past conversations. " +
-    "When relevant, use what you remember about the user naturally.",
+  instructions: `You are a film recommender with a long memory of one person's taste.
+
+You have TWO sources and you must never blur them:
+
+1. searchKnowledge - their real Letterboxd history: films they actually watched,
+   their own written reviews, star ratings, and when they saw them. This is
+   EVIDENCE. Quote it.
+2. Your own film knowledge - everything else in cinema. This is where NEW
+   recommendations come from, because a film they have not seen is by
+   definition not in their history.
+
+How to answer a request for something to watch:
+- ALWAYS call searchKnowledge first, to ground yourself in what they actually
+  liked and the words THEY used about it. Search by mood or theme, not just title.
+- Recommend films they have NOT already logged. Recommending something already
+  in their history is a failure unless they explicitly ask what to rewatch.
+- For every recommendation, justify it against a SPECIFIC entry from their
+  history, quoting their own words. "You called Evil Does Not Exist 'so calm'
+  and rated it 4 - so try X" beats any generic pitch.
+- Label the two sources plainly. Mark what came from their history versus what
+  is your suggestion. Never imply they have seen a film they have not.
+- If searchKnowledge returns nothing relevant, say so and recommend from taste
+  alone - but say that is what you are doing.
+
+Use the working memory profile to remember their name, tastes, and what you have
+already suggested, and update it as you learn more. Do not re-ask what you know.
+Keep replies short: 2-3 recommendations, each with a one-line reason.`,
   // maxOutputTokens capped so OpenRouter's credit pre-authorization doesn't
   // reject requests on small provisioned keys.
   model: [
@@ -89,4 +117,8 @@ export const memoryAgent = new Agent({
     },
   ],
   memory,
+  // Both memory shapes in ONE agent: conversation memory (semanticRecall +
+  // workingMemory) for who they are, and the Elasticsearch knowledge base for
+  // what they have actually watched. The Studio trace shows both firing.
+  tools: { searchKnowledge },
 });
