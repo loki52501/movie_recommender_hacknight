@@ -29,6 +29,7 @@ const es = new Client({
 const INDEX = process.env.KNOWLEDGE_INDEX ?? "knowledge-base";
 
 /** How often to check whether the film tab is still open, and how long to wait. */
+const PAGE_SETTLE_MS = Number(process.env.PAGE_SETTLE_MS ?? 9000);
 const TAB_POLL_MS = Number(process.env.TAB_POLL_MS ?? 15_000);
 const WATCH_TIMEOUT_MS = Number(process.env.WATCH_TIMEOUT_MS ?? 4 * 60 * 60 * 1000);
 
@@ -80,17 +81,46 @@ const recommend = createStep({
     candidateTitles: z.array(z.string()),
     tasteEvidence: tasteEvidenceSchema,
   }),
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, mastra }) => {
     const recall: any = await call(recallRecentTaste, { query: inputData.request, limit: 8 });
-    return {
-      request: inputData.request,
-      candidateTitles: inputData.candidateTitles ?? [],
-      tasteEvidence: recall.results.map((r: any) => ({
-        title: String(r.title),
-        content: String(r.content),
-        recency: Number(r.recency ?? 0),
-      })),
-    };
+    const tasteEvidence = recall.results.map((r: any) => ({
+      title: String(r.title),
+      content: String(r.content),
+      recency: Number(r.recency ?? 0),
+    }));
+
+    // Caller-supplied titles win; otherwise derive ten from their own reviews.
+    let candidateTitles: string[] = inputData.candidateTitles ?? [];
+    if (candidateTitles.length === 0) {
+      const seen = new Set<string>(
+        tasteEvidence.map((t: any) =>
+          String(t.title).toLowerCase().replace(/\s*\(\d{4}\)\s*/, "").trim()
+        )
+      );
+      try {
+        const agent = mastra!.getAgent("memoryAgent");
+        const res: any = await agent.generate(
+          [
+            `They asked for: "${inputData.request}".`,
+            "Suggest TEN films they have NOT already seen, matching the taste below.",
+            "Reply with ONLY a JSON array of title strings. No years, no commentary.",
+            "",
+            "Their recent watches, in their own words:",
+            ...tasteEvidence.slice(0, 8).map((t: any) => `- ${t.title}: ${t.content}`),
+          ].join(String.fromCharCode(10))
+        );
+        const raw = String(res?.text ?? "");
+        const arr = JSON.parse(raw.slice(raw.indexOf("["), raw.lastIndexOf("]") + 1));
+        candidateTitles = (arr as string[])
+          .map((t) => String(t).trim())
+          .filter((t) => t && !seen.has(t.toLowerCase()))
+          .slice(0, 10);
+      } catch {
+        candidateTitles = [];
+      }
+    }
+
+    return { request: inputData.request, candidateTitles, tasteEvidence };
   },
 });
 
@@ -105,10 +135,13 @@ const pageIdFrom = (res: any): unknown => {
   if (res?.page !== undefined) return res.page;
   try {
     const parsed = JSON.parse(mcpText(res));
-    return parsed?.pageId ?? parsed?.page;
+    const fromJson = parsed?.pageId ?? parsed?.page;
+    if (fromJson !== undefined) return fromJson;
   } catch {
-    return undefined;
+    /* not JSON - fall through to the text form below */
   }
+  // Usual case: the id exists only as prose, e.g. "opened page 14".
+  return mcpPageId(res);
 };
 
 const checkPrime = createStep({
@@ -157,7 +190,7 @@ const checkPrime = createStep({
       };
     }
 
-    for (const title of inputData.candidateTitles.slice(0, 5)) {
+    for (const title of inputData.candidateTitles.slice(0, 10)) {
       const url = mkUrl(title);
       let pageId: unknown;
       try {
@@ -166,15 +199,18 @@ const checkPrime = createStep({
         // arguments never reach the MCP server.
         const page: any = await call(tools.neo_tabs, { action: "new", url });
         pageId = pageIdFrom(page);
-        await tools.neo_wait
-          ?.execute({ page: pageId, for: "time", value: 6000 })
-          .catch(() => {});
+        // Plain sleep, not neo_wait: neo_wait wants for:"text"/"selector", and
+        // an invalid shape here was being swallowed, so the grep ran against a
+        // page that had not rendered its results yet.
+        await new Promise((r) => setTimeout(r, PAGE_SETTLE_MS));
         // Grep the accessibility tree: result cards surface as links/buttons
         // carrying the film's title. Entitlement (included vs rent) is NOT
         // exposed at search level, so onPrime means "in the catalogue".
         const found: any = await call(tools.neo_grep, {
           page: pageId,
-          pattern: title.split(/\s+/).slice(0, 3).join("\\s+"),
+            // No regex escapes: a backslash does not survive the MCP transport
+            // ("Tokyo\s+Story" arrives as "Tokyos+Story"). Plain words match.
+            pattern: title.replace(/[^\w\s]/g, " ").split(/\s+/).filter(Boolean).slice(0, 3).join(" "),
           limit: 15,
         });
         const lines = mcpText(found)
