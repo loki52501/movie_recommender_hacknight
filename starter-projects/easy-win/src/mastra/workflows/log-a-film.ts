@@ -65,13 +65,30 @@ const checkPrime = createStep({
   id: "check-prime",
   inputSchema: recommend.outputSchema,
   outputSchema: z.object({
-    candidates: z.array(z.object({ title: z.string(), onPrime: z.boolean(), url: z.string() })),
+    candidates: z.array(
+      z.object({
+        title: z.string(),
+        onPrime: z.boolean(),
+        matchedTitle: z.string(),
+        url: z.string(),
+      })
+    ),
     tasteEvidence: tasteEvidenceSchema,
   }),
   execute: async ({ inputData }) => {
-    const candidates: { title: string; onPrime: boolean; url: string }[] = [];
+    const candidates: {
+      title: string;
+      onPrime: boolean;
+      matchedTitle: string;
+      url: string;
+    }[] = [];
+    // Prime Video's own search, NOT /s?k=...&i=instant-video - the ordinary
+    // Amazon search page carries no video results we can read.
     const mkUrl = (t: string) =>
-      `https://www.amazon.com/s?k=${encodeURIComponent(t)}&i=instant-video`;
+      `https://www.amazon.com/gp/video/search?phrase=${encodeURIComponent(t)}`;
+
+    /** Loose match: "Tokyo Story" should match "Tokyo Story (English Subtitled)". */
+    const norm = (s: string) => s.toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
 
     // neo being down must degrade this step, not kill the whole run - the
     // recommendation is still useful without a verified availability check.
@@ -83,6 +100,7 @@ const checkPrime = createStep({
         candidates: inputData.candidateTitles.map((t) => ({
           title: t,
           onPrime: false,
+          matchedTitle: "",
           url: mkUrl(t),
         })),
         tasteEvidence: inputData.tasteEvidence,
@@ -95,17 +113,25 @@ const checkPrime = createStep({
       try {
         const page: any = await tools.neo_tabs.execute({ context: { action: "new", url } });
         pageId = page?.pageId ?? page?.page;
-        const text: any = await tools.neo_read.execute({
-          context: { page: pageId, format: "text" },
+        await tools.neo_wait
+          ?.execute({ context: { page: pageId, for: "time", value: 6000 } })
+          .catch(() => {});
+        // Grep the accessibility tree: result cards surface as links/buttons
+        // carrying the film's title. Entitlement (included vs rent) is NOT
+        // exposed at search level, so onPrime means "in the catalogue".
+        const found: any = await tools.neo_grep.execute({
+          context: { page: pageId, pattern: title.split(/\s+/).slice(0, 3).join("\\s+"), limit: 15 },
         });
-        const body = String(text?.content ?? text ?? "");
-        candidates.push({
-          title,
-          onPrime: /included with prime|watch now|prime video|included with your prime/i.test(body),
-          url,
-        });
+        const lines = String(found?.content ?? found ?? "")
+          .split("\n")
+          .filter((l) => /link|button/i.test(l));
+        const want = norm(title);
+        const hit = lines
+          .map((l) => (l.match(/"([^"]+)"/) || [])[1] ?? "")
+          .find((t) => t && (norm(t).startsWith(want) || want.startsWith(norm(t))));
+        candidates.push({ title, onPrime: Boolean(hit), matchedTitle: hit ?? "", url });
       } catch {
-        candidates.push({ title, onPrime: false, url });
+        candidates.push({ title, onPrime: false, matchedTitle: "", url });
       } finally {
         // Close the tab even when the read failed, so a long candidate list
         // does not leave a trail of open tabs in the user's browser.
